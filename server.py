@@ -1,58 +1,46 @@
 from flask import Flask, request, jsonify
-import requests
-import os
-import datetime as dt
+import os, requests, time
 
 app = Flask(__name__)
 
-# --- ENV (Railway Variables) ---
-TD_USERNAME   = os.environ.get("TD_USERNAME")
-TD_PASSWORD   = os.environ.get("TD_PASSWORD")
-TD_CID        = os.environ.get("TD_CID")
-TD_SEC        = os.environ.get("TD_SEC")
-TD_ACCOUNT_ID = os.environ.get("TD_ACCOUNT_ID")  # ex: 861089 (l'id, pas "name")
+# --- ENV (Railway) ---
+TD_USERNAME     = os.environ.get("TD_USERNAME")
+TD_PASSWORD     = os.environ.get("TD_PASSWORD")
+TD_CID          = os.environ.get("TD_CID")        # API Client ID
+TD_SEC          = os.environ.get("TD_SEC")        # API Secret
+TD_ACCOUNT_ID   = os.environ.get("TD_ACCOUNT_ID") # ex: 861089
+TD_ACCOUNT_SPEC = os.environ.get("TD_ACCOUNT_SPEC")  # ex: "1697337"
 
-BASE_URL  = "https://live.tradovateapi.com/v1"
-LOGIN_URL = f"{BASE_URL}/auth/accesstokenrequest"
-ORDER_URL = f"{BASE_URL}/order/place"
+# Choose LIVE or DEMO
+BASE_URL  = os.environ.get("TD_BASE_URL", "https://live.tradovateapi.com/v1")
+LOGIN_URL = f"{BASE_URL}/auth/accesstoken"
+ORDER_URL = f"{BASE_URL}/order/placeorder"
 
-# --- Token cache (in-memory) ---
-_token = None
-_token_expiry = None  # datetime
+# --- simple token cache ---
+_token = {"accessToken": None, "expiresAt": 0}
 
-def _parse_expiry(expiration_time: str):
-    # ex: "2026-02-06T10:36:22.557Z"
-    if not expiration_time:
-        return None
-    if expiration_time.endswith("Z"):
-        expiration_time = expiration_time.replace("Z", "+00:00")
-    return dt.datetime.fromisoformat(expiration_time)
-
-def td_login():
-    global _token, _token_expiry
-
-    missing = [k for k, v in {
+def require_env():
+    missing = [k for k,v in {
         "TD_USERNAME": TD_USERNAME,
         "TD_PASSWORD": TD_PASSWORD,
         "TD_CID": TD_CID,
         "TD_SEC": TD_SEC,
         "TD_ACCOUNT_ID": TD_ACCOUNT_ID,
+        "TD_ACCOUNT_SPEC": TD_ACCOUNT_SPEC,
     }.items() if not v]
+    return missing
 
-    if missing:
-        raise RuntimeError(f"Missing env vars: {missing}")
-
-    # token encore valide ?
-    now = dt.datetime.now(dt.timezone.utc)
-    if _token and _token_expiry and now < (_token_expiry - dt.timedelta(seconds=30)):
-        return _token
+def td_login():
+    # cache valid token
+    now = int(time.time())
+    if _token["accessToken"] and now < _token["expiresAt"] - 30:
+        return _token["accessToken"]
 
     payload = {
         "name": TD_USERNAME,
         "password": TD_PASSWORD,
         "appId": TD_CID,
-        "appVersion": "1.0",
-        "deviceId": "railway-bot",
+        "appVersion": "1",
         "cid": TD_CID,
         "sec": TD_SEC
     }
@@ -61,14 +49,45 @@ def td_login():
     print("Login status:", r.status_code, "body:", r.text)
     r.raise_for_status()
 
-    js = r.json()
-    _token = js.get("accessToken")
-    _token_expiry = _parse_expiry(js.get("expirationTime"))
+    j = r.json()
+    _token["accessToken"] = j["accessToken"]
 
-    if not _token:
-        raise RuntimeError(f"Login OK but no accessToken in response: {js}")
+    # expirationTime ressemble à "2026-02-06T10:46:32.335Z"
+    # on met un TTL safe (20 min) si on ne veut pas parser la date
+    _token["expiresAt"] = int(time.time()) + 20*60
+    return _token["accessToken"]
 
-    return _token
+def place_market_order(symbol: str, side: str, qty: int):
+    access = td_login()
+
+    order = {
+        "accountSpec": str(TD_ACCOUNT_SPEC),
+        "accountId": int(TD_ACCOUNT_ID),
+        "symbol": symbol,              # ex: "MNQH6" (contrat réel)
+        "orderQty": int(qty),
+        "orderType": "Market",
+        "timeInForce": "Day",
+        "isAutomated": True
+    }
+
+    # Tradovate ne met pas toujours "action" dans placeorder.
+    # Si ton compte exige le side explicite, on passe par la convention :
+    # Buy = qty positive, Sell = qty positive MAIS on envoie un "side" si nécessaire.
+    # (Si ça refuse, on adaptera au retour d’erreur exact.)
+    if side.lower() == "sell":
+        # option A: qty négatif (souvent accepté)
+        order["orderQty"] = -int(qty)
+
+    headers = {
+        "Authorization": f"Bearer {access}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    r = requests.post(ORDER_URL, json=order, headers=headers, timeout=15)
+    print("Order status:", r.status_code, "body:", r.text)
+    r.raise_for_status()
+    return r.json() if r.text else {"status": "sent"}
 
 @app.route("/", methods=["GET"])
 def home():
@@ -76,40 +95,22 @@ def home():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    missing = require_env()
+    if missing:
+        return jsonify({"status":"error", "error": f"Missing env vars: {missing}"}), 500
+
+    data = request.get_json(force=True, silent=True) or {}
+    print("Received:", data)
+
+    symbol = data.get("ticker")  # IMPORTANT: doit être un contrat (MNQH6), pas MNQ1!
+    action = (data.get("action") or "").lower()
+    qty    = int(data.get("quantity", 0))
+
+    if not symbol or action not in ("buy","sell") or qty <= 0:
+        return jsonify({"status":"error","error":"Bad payload. Need ticker/action/quantity"}), 400
+
     try:
-        data = request.get_json(force=True, silent=False)
-        print("Received:", data)
-
-        ticker = data["ticker"]      # ATTENTION: doit être un symbole Tradovate valide (voir note plus bas)
-        action = data["action"]      # "buy" / "sell"
-        qty    = int(data["quantity"])
-
-        token = td_login()
-
-        order = {
-            "accountId": int(TD_ACCOUNT_ID),
-            "action": "Buy" if action == "buy" else "Sell",
-            "symbol": ticker,
-            "orderQty": qty,
-            "orderType": "Market"
-        }
-
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        }
-
-        r = requests.post(ORDER_URL, json=order, headers=headers, timeout=15)
-        print("Order status:", r.status_code, "body:", r.text)
-
-        # Tradovate peut répondre 200 + failureReason => on le renvoie au client
-        try:
-            resp_json = r.json()
-        except Exception:
-            resp_json = {"raw": r.text}
-
-        return jsonify({"status": "ok", "tradovate": resp_json}), 200
-
+        res = place_market_order(symbol, action, qty)
+        return jsonify({"status":"ok", "tradovate": res})
     except Exception as e:
-        print("ERROR:", str(e))
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return jsonify({"status":"error", "error": str(e)}), 500

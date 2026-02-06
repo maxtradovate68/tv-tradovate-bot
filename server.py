@@ -11,7 +11,7 @@ TD_SEC          = os.environ.get("TD_SEC")
 TD_ACCOUNT_ID   = os.environ.get("TD_ACCOUNT_ID")
 TD_ACCOUNT_SPEC = os.environ.get("TD_ACCOUNT_SPEC")
 
-BASE = "https://live.tradovateapi.com/v1"
+BASE = "https://live-api.tradovate.com/v1"
 
 def td_login():
     url = f"{BASE}/auth/accesstoken"

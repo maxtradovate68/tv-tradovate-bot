@@ -4,33 +4,35 @@ import os
 
 app = Flask(__name__)
 
-TD_USERNAME     = os.environ.get("TD_USERNAME")
-TD_PASSWORD     = os.environ.get("TD_PASSWORD")
-TD_CID          = os.environ.get("TD_CID")
-TD_SEC          = os.environ.get("TD_SEC")
-TD_ACCOUNT_ID   = os.environ.get("TD_ACCOUNT_ID")
-TD_ACCOUNT_SPEC = os.environ.get("TD_ACCOUNT_SPEC")
+# ENV
+TD_USERNAME   = os.getenv("TD_USERNAME")
+TD_PASSWORD   = os.getenv("TD_PASSWORD")
+TD_CID        = os.getenv("TD_CID")      # Client ID
+TD_SEC        = os.getenv("TD_SEC")      # Client Secret
+TD_ACCOUNT_ID = os.getenv("TD_ACCOUNT_ID")  # IMPORTANT: l'ID numérique ex: 861089
 
-LOGIN_URL = "https://live.tradovateapi.com/v1/auth/accesstoken"
+BASE_URL  = "https://live.tradovateapi.com"
+LOGIN_URL = f"{BASE_URL}/v1/auth/accesstoken"
+ORDER_URL = f"{BASE_URL}/v1/order/place"
+
+def missing_env():
+    need = ["TD_USERNAME","TD_PASSWORD","TD_CID","TD_SEC","TD_ACCOUNT_ID"]
+    missing = [k for k in need if not os.getenv(k)]
+    return missing
 
 def td_login():
-    url = f"{BASE}/auth/accesstoken"
     payload = {
         "name": TD_USERNAME,
         "password": TD_PASSWORD,
         "appId": TD_CID,
         "appVersion": "1.0",
-        "deviceId": "railway",
         "cid": TD_CID,
-        "sec": TD_SEC,
+        "sec": TD_SEC
     }
-    r = requests.post(url, json=payload, timeout=20)
+    r = requests.post(LOGIN_URL, json=payload, timeout=15)
+    print("Login status:", r.status_code, "body:", r.text)
     r.raise_for_status()
     return r.json()["accessToken"]
-
-r = requests.post(LOGIN_URL, json=payload, timeout=15)
-print("Login status:", r.status_code, "body:", r.text)
-r.raise_for_status()
 
 @app.route("/", methods=["GET"])
 def home():
@@ -38,30 +40,46 @@ def home():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(force=True)
+    miss = missing_env()
+    if miss:
+        return jsonify({"status": "error", "error": f"Missing env vars: {miss}"}), 500
+
+    data = request.get_json(force=True, silent=True) or {}
     print("Received:", data)
 
-    ticker = data["ticker"]              # ex: "MNQ"
-    action = data["action"]              # "buy" / "sell"
-    qty    = int(data["quantity"])       # IMPORTANT: int
+    symbol = data.get("ticker", "MNQ")
+    side   = data.get("action", "").lower()
+    qty    = int(data.get("quantity", 0))
 
-    access_token = td_login()
+    if side not in ("buy", "sell") or qty <= 0:
+        return jsonify({"status": "error", "error": "Bad payload (action/quantity)"}), 400
 
-    order = {
-        "accountId": int(TD_ACCOUNT_ID),         # IMPORTANT: int
-        "accountSpec": TD_ACCOUNT_SPEC,          # ex: "1697337"
-        "action": "Buy" if action == "buy" else "Sell",
-        "symbol": ticker,                        # on verra après pour front-month auto
-        "orderType": "Market",
-        "orderQty": qty                          # IMPORTANT: orderQty (pas quantity)
-    }
+    try:
+        token = td_login()
 
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
+        order = {
+            "accountId": int(TD_ACCOUNT_ID),
+            "action": "Buy" if side == "buy" else "Sell",
+            "symbol": symbol,
+            "ordType": "Market",
+            "orderQty": qty,
+            "isAutomated": True
+        }
 
-    r = requests.post(f"{BASE}/order/place", json=order, headers=headers, timeout=20)
-    print("Order status:", r.status_code, "body:", r.text)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
 
-    return jsonify({"status": "ok", "tradovate_status": r.status_code, "tradovate_body": r.text})
+        r = requests.post(ORDER_URL, json=order, headers=headers, timeout=15)
+        print("Order status:", r.status_code, "body:", r.text)
+
+        # si Tradovate refuse, on renvoie l’erreur au caller (TradingView / curl)
+        if r.status_code >= 400:
+            return jsonify({"status": "error", "tradovate": r.text}), 400
+
+        return jsonify({"status": "ok", "tradovate": r.json()})
+
+    except Exception as e:
+        print("ERROR:", str(e))
+        return jsonify({"status": "error", "error": str(e)}), 500

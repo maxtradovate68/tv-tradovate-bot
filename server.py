@@ -10,7 +10,7 @@ TD_SEC        = os.environ.get("TD_SEC")
 TD_ACCOUNT_ID = os.environ.get("TD_ACCOUNT_ID")
 
 AUTH_URL  = "https://live.tradovateapi.com/v1/auth/accesstokenrequest"
-ORDER_URL = "https://live.tradovateapi.com/v1/order/placeorder"  # plus standard que /order/place
+ORDER_URL = "https://live.tradovateapi.com/v1/order/placeorder" # plus standard que /order/place
 
 # cache token en mémoire
 _cached_token = None
@@ -68,7 +68,7 @@ def webhook():
         "action": "Buy" if action == "buy" else "Sell",
         "symbol": ticker,      # ex: "MNQ" ou "MNQH6" selon ce que tu veux gérer
         "orderType": "Market",
-        "quantity": qty
+        "orderQty": qty
     }
 
     headers = {

@@ -1,5 +1,7 @@
 from flask import Flask, request, jsonify
-import requests, os, time
+import requests
+import os
+import time
 
 app = Flask(__name__)
 
@@ -8,24 +10,26 @@ TD_PASSWORD   = os.environ.get("TD_PASSWORD")
 TD_CID        = os.environ.get("TD_CID")
 TD_SEC        = os.environ.get("TD_SEC")
 TD_ACCOUNT_ID = os.environ.get("TD_ACCOUNT_ID")
+TD_ACCOUNT_SPEC = os.environ.get("TD_ACCOUNT_SPEC")
+TRADOVATE_ENV = os.environ.get("TRADOVATE_ENV", "live")  # "live" or "demo"
 
-AUTH_URL  = "https://live.tradovateapi.com/v1/auth/accesstokenrequest"
-ORDER_URL = "https://live.tradovateapi.com/v1/order/placeorder" # plus standard que /order/place
+BASE_URL = "https://live.tradovateapi.com/v1" if TRADOVATE_ENV == "live" else "https://demo.tradovateapi.com/v1"
 
-# cache token en mémoire
+# cache token
 _cached_token = None
-_cached_exp_ms = 0
+_cached_token_exp_ms = 0
+
+def _now_ms():
+    return int(time.time() * 1000)
 
 def get_access_token():
-    global _cached_token, _cached_exp_ms
+    global _cached_token, _cached_token_exp_ms
 
-    now_ms = int(time.time() * 1000)
-    if _cached_token and now_ms < (_cached_exp_ms - 30_000):  # marge 30s
+    # if token still valid (give 30s margin)
+    if _cached_token and _now_ms() < (_cached_token_exp_ms - 30_000):
         return _cached_token
 
-    if not all([TD_USERNAME, TD_PASSWORD, TD_CID, TD_SEC]):
-        raise RuntimeError("Missing TD_* env vars for login")
-
+    url = f"{BASE_URL}/auth/accesstokenrequest"
     payload = {
         "name": TD_USERNAME,
         "password": TD_PASSWORD,
@@ -33,16 +37,16 @@ def get_access_token():
         "appVersion": "1.0",
         "cid": TD_CID,
         "sec": TD_SEC,
-        "deviceId": "railway-bot"
     }
 
-    r = requests.post(AUTH_URL, json=payload, timeout=20)
-    print("Login status:", r.status_code, "body:", r.text)
+    r = requests.post(url, json=payload, timeout=10)
     r.raise_for_status()
-    j = r.json()
+    data = r.json()
 
-    _cached_token = j["accessToken"]
-    _cached_exp_ms = j.get("expirationTime", 0)  # Tradovate renvoie souvent un timestamp ms
+    _cached_token = data["accessToken"]
+    # expirationTime is ISO; simplest: assume ~1h if not parsing.
+    # If you want exact parsing later, we can add it.
+    _cached_token_exp_ms = _now_ms() + 55 * 60 * 1000
     return _cached_token
 
 @app.route("/", methods=["GET"])
@@ -59,28 +63,49 @@ def webhook():
     qty    = int(data.get("quantity", 0))
 
     if not ticker or action not in ("buy", "sell") or qty <= 0:
-        return jsonify({"status":"error", "error":"Bad payload"}), 400
+        return jsonify({"status":"error","error":"Bad payload"}), 400
 
     token = get_access_token()
 
+    # ⚠️ Tradovate expects orderQty (not quantity) and endpoint is placeorder.
     order = {
-        "accountId": int(TD_ACCOUNT_ID),
+        "accountSpec": TD_ACCOUNT_SPEC,
+        "accountId": str(TD_ACCOUNT_ID),
         "action": "Buy" if action == "buy" else "Sell",
-        "symbol": ticker,      # ex: "MNQ" ou "MNQH6" selon ce que tu veux gérer
+        "symbol": ticker,
+        "orderQty": qty,
         "orderType": "Market",
-        "orderQty": qty
+        "isAutomated": "true"
     }
 
     headers = {
         "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
         "Content-Type": "application/json"
     }
 
-    r = requests.post(ORDER_URL, json=order, headers=headers, timeout=20)
+    url = f"{BASE_URL}/order/placeorder"
+    r = requests.post(url, json=order, headers=headers, timeout=10)
+
     print("Order status:", r.status_code, "body:", r.text)
 
-    # IMPORTANT: si Tradovate refuse, on remonte l’erreur (sinon tu crois que “c’est ok”)
-    if r.status_code >= 300:
-        return jsonify({"status":"error", "tradovate": r.text}), 500
+    # IMPORTANT: if Tradovate refuses, return 500 so you see it
+    if r.status_code != 200:
+        return jsonify({"status":"error","tradovate_status": r.status_code, "body": r.text}), 500
 
-    return jsonify({"status":"ok", "tradovate": r.json() if r.headers.get("content-type","").startswith("application/json") else r.text})
+    return jsonify({"status":"ok","tradovate": r.json()})
+
+@app.route("/accounts", methods=["GET"])
+def list_accounts():
+    token = get_access_token()
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json"
+    }
+
+    url = f"{BASE_URL}/account/list"
+    r = requests.get(url, headers=headers, timeout=10)
+
+    print("Account list:", r.text)
+    return r.text

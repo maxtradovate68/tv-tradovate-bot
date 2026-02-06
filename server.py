@@ -11,7 +11,7 @@ TD_SEC          = os.environ.get("TD_SEC")
 TD_ACCOUNT_ID   = os.environ.get("TD_ACCOUNT_ID")
 TD_ACCOUNT_SPEC = os.environ.get("TD_ACCOUNT_SPEC")
 
-BASE = "https://live-api.tradovate.com/v1"
+LOGIN_URL = "https://live.tradovateapi.com/v1/auth/accesstoken"
 
 def td_login():
     url = f"{BASE}/auth/accesstoken"
@@ -27,6 +27,10 @@ def td_login():
     r = requests.post(url, json=payload, timeout=20)
     r.raise_for_status()
     return r.json()["accessToken"]
+
+r = requests.post(LOGIN_URL, json=payload, timeout=15)
+print("Login status:", r.status_code, "body:", r.text)
+r.raise_for_status()
 
 @app.route("/", methods=["GET"])
 def home():
